@@ -1,1 +1,153 @@
 
+import time
+from PIL import Image
+import pytesseract
+from selenium import webdriver
+from selenium.webdriver.edge.service import Service as EdgeService
+from selenium.webdriver.edge.options import Options as EdgeOptions
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait, Select
+from selenium.webdriver.support import expected_conditions as EC
+import pandas as pd
+
+# — Ajusta la ruta a tu msedgedriver.exe —
+RUTA_EDGE_DRIVER = r"C:/WebDriver/msedgedriver.exe"
+# — Ajusta la ruta a tu tesseract.exe —
+pytesseract.pytesseract.tesseract_cmd = r'C:/Program Files/Tesseract-OCR/tesseract.exe'
+
+# 1) Lanzar Edge
+options = EdgeOptions()
+options.use_chromium = True
+driver = webdriver.Edge(service=EdgeService(executable_path=RUTA_EDGE_DRIVER), options=options)
+wait = WebDriverWait(driver, 30)
+
+try:
+    # 2) Abrir página
+    driver.get("http://res1104.se.gob.ar/consultaprecios.eess.php")
+
+    # 3) Entrar al iframe para los primeros filtros
+    wait.until(EC.frame_to_be_available_and_switch_to_it((By.ID, "iframe_consultaprecios")))
+
+    # Provincia
+    Select(wait.until(EC.presence_of_element_located((By.ID, "codigodeprovincia"))))\
+        .select_by_visible_text("BUENOS AIRES")
+    time.sleep(1)
+    
+    # Localidad
+    Select(wait.until(EC.presence_of_element_located((By.ID, "idlocalidad"))))\
+        .select_by_visible_text("SAN ANTONIO DE PADUA")
+    time.sleep(1)
+    
+    # # Razón Social
+    # Select(wait.until(EC.presence_of_element_located((By.ID, "idempresa"))))\
+    #     .select_by_visible_text("SARAFE S.A.")
+    # time.sleep(1)
+
+    # 4) Volver al contenido principal para los selects globales
+    driver.switch_to.default_content()
+
+    # 1) Listar imágenes
+    imgs = driver.find_elements(By.TAG_NAME, "img")
+    print(f"🔍 imágenes totales: {len(imgs)}")
+    for i, img in enumerate(imgs):
+        print(f"   [{i}] id={img.get_attribute('id')}, src={img.get_attribute('src')}")
+
+    # 2) Localizar captcha por XPath flexible
+    captcha_img = wait.until(EC.presence_of_element_located((
+        By.XPATH, "//img[contains(@src, 'captcha')]"
+    )))
+    print("🔍 Captcha src:", captcha_img.get_attribute("src"))
+
+    # 3) Guardar screenshot
+    ok = captcha_img.screenshot("captcha.png")
+    print("📸 screenshot guardado:", ok)
+
+    # 7) Leer código con OCR
+    texto = pytesseract.image_to_string(Image.open("captcha.png"), config='--psm 8 digits')
+    codigo = ''.join(filter(str.isdigit, texto))
+    print("🔢 Captcha leído:", codigo)
+
+    # 8) Ingresar el captcha y enviar
+    driver.switch_to.default_content()
+    campo = wait.until(EC.presence_of_element_located((By.NAME, "tmptxt")))
+    campo.clear()
+    campo.send_keys(codigo)
+    driver.find_element(By.XPATH, "//input[@value='Consultar']").click()
+    print("✅ Formulario enviado")
+    time.sleep(5)
+
+    # --- Start of the refined data extraction ---
+
+    # 1) Esperar que la tabla de resultados esté presente
+    # Based on your HTML, the main data table is directly under a <br> tag after
+    # the search parameters table and has a specific structure.
+    # We can try to locate it by its structure or by checking for the specific headers.
+    data_table_element = wait.until(EC.presence_of_element_located((By.XPATH, "//table[@width='90%' and @align='center' and @cellpadding='2' and @cellspacing='1']")))
+
+    # 2) Obtener el HTML de la tabla específica
+    table_html = data_table_element.get_attribute('outerHTML')
+
+    # 3) Leer la tabla con pandas
+    # pd.read_html returns a list of DataFrames. We expect only one table from `table_html`.
+    tablas = pd.read_html(table_html, decimal=',', thousands='.')
+
+    if tablas:
+        df = tablas[0]
+
+        # Clean up the DataFrame: The first row contains the actual headers
+        # and there are some navigation rows that might be picked up.
+        # Let's define the expected headers and filter rows.
+        # The relevant rows start with a locality and have 9 columns as per the HTML.
+
+        # The actual header row in your HTML is:
+        # <tr align="center" valign="middle" bgcolor="#FF8612" class="blanco">
+        #   <td width="10%"><strong>Localidad</strong></td>
+        #   ...
+        # </tr>
+        # And the data rows are:
+        # <tr align="center" valign="middle" bgcolor="#FFCC99"><td>SAN ANTONIO DE PADUA</td><td>Gas Oil Grado 2</td>...</tr>
+
+        # We need to find the row that contains the actual column names (Localidad, Derivado, etc.)
+        # and set it as the header.
+        
+        # Find the row with the actual column names
+        header_row_index = -1
+        for i, row in df.iterrows():
+            if 'Localidad' in row.values and 'Derivado' in row.values and 'Precio final' in row.values:
+                header_row_index = i
+                break
+        
+        if header_row_index != -1:
+            # Set the found row as the new header
+            df.columns = df.iloc[header_row_index]
+            df = df[header_row_index+1:] # Remove the rows before the header and the header itself
+
+            # Reset index
+            df = df.reset_index(drop=True)
+
+            # Filter out any navigation rows if they were incorrectly parsed (e.g., "Primera Página")
+            # We can check if the 'Localidad' column actually contains a locality name.
+            df = df[df['Localidad'].isin(['SAN ANTONIO DE PADUA'])]
+            
+            # Ensure numeric columns are correctly typed
+            numeric_cols = ['Precio sin impuesto', 'Precio final', 'Volumen informado (m3)']
+            for col in numeric_cols:
+                # Replace comma with dot for decimal conversion if necessary
+                if df[col].dtype == 'object':
+                    df[col] = df[col].astype(str).str.replace('.', '', regex=False).str.replace(',', '.', regex=False)
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+
+
+            # 4) Guardar en Excel en el directorio actual
+            nombre_archivo = "resultados_precio_surtidor.xlsx"
+            df.to_excel(nombre_archivo, index=False)
+
+            print(f"✅ Resultados guardados en Excel: {nombre_archivo}")
+        else:
+            print("❌ Could not find the header row in the table.")
+    else:
+        print("❌ No tables found by pandas in the target HTML.")
+
+finally:
+    driver.quit()
+    print("🔚 Navegador cerrado")
